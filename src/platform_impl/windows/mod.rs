@@ -13,6 +13,7 @@ pub(crate) use self::{
     icon::WinIcon,
     monitor::{MonitorHandle, VideoMode},
     window::Window,
+    tray::Tray,
 };
 
 pub use self::icon::WinIcon as PlatformIcon;
@@ -183,3 +184,4 @@ mod monitor;
 mod raw_input;
 mod window;
 mod window_state;
+mod tray;

@@ -179,6 +179,7 @@ pub mod keyboard;
 pub mod monitor;
 mod platform_impl;
 pub mod window;
+pub mod tray;
 
 pub mod platform;
 
