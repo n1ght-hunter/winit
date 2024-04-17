@@ -1,44 +1,47 @@
-use std::ops::Deref;
+use std::{cell::Cell, ops::Deref};
 
 use rwh_06::RawWindowHandle;
 use windows_sys::Win32::{
-    Foundation::HWND,
-    Foundation::{LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
-    UI::WindowsAndMessaging::{
-        DefWindowProcW, GetCursorPos, PostQuitMessage, RegisterWindowMessageW, SetForegroundWindow,
-        WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONUP,
-        WM_MENUCOMMAND, WM_RBUTTONDBLCLK, WM_RBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONUP,
-    },
     UI::{
         Shell::{
             Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_MODIFY, NOTIFYICONDATAW,
         },
         WindowsAndMessaging::{
-            CreatePopupMenu, CreateWindowExW, LoadIconW, RegisterClassW, SetMenuInfo,
-            CW_USEDEFAULT, HICON, IDI_APPLICATION, MENUINFO, MIM_APPLYTOSUBMENUS, MIM_STYLE,
-            MNS_NOTIFYBYPOS, WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            CreatePopupMenu, CreateWindowExW, DefWindowProcW, GetCursorPos, LoadIconW, PostQuitMessage, RegisterClassExW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetMenuInfo, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_USERDATA, HICON, IDI_APPLICATION, MENUINFO, MIM_APPLYTOSUBMENUS, MIM_STYLE, MNS_NOTIFYBYPOS, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MENUCOMMAND, WM_MOUSEMOVE, WM_NCCREATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WNDCLASSW, WS_OVERLAPPEDWINDOW
         },
     },
 };
 
-use crate::{error::OsError as RootOsError, window::Icon};
+use crate::{
+    dpi::PhysicalPosition,
+    error::OsError as RootOsError,
+    event::Event,
+    platform_impl::platform::{event_loop::ProcResult, WindowId, DEVICE_ID},
+    tray::TrayBuilder,
+    window::{Icon, WindowId as RootWindowId},
+};
 
-use super::util;
+use super::{event_loop::runner::EventLoopRunnerShared, util, EventLoopWindowTarget};
 
 #[derive(Clone)]
 pub struct Tray(HWND);
 
 impl Tray {
-    pub fn new<T: 'static>() -> Result<Tray, RootOsError> {
-        init_window::<T>(None)
+    pub fn new<T: 'static>(
+        tray_builder: TrayBuilder,
+        event_loop: &EventLoopWindowTarget<T>,
+    ) -> Result<Tray, RootOsError> {
+        let tray = init_window::<T>(tray_builder.parent_window, tray_builder.tooltip, event_loop)?;
+        if let Some(icon) = tray_builder.icon {
+            tray.set_icon(icon)?;
+        }
+        Ok(tray)
     }
-    pub fn with_parent<T: 'static>(parent_hwnd: RawWindowHandle) -> Result<Tray, RootOsError> {
-        let parent_hwnd = match parent_hwnd {
-            RawWindowHandle::Win32(handle) => handle.hwnd,
-            _ => unreachable!("Invalid raw window handle {parent_hwnd:?} on Windows"),
-        };
-        init_window::<T>(Some(parent_hwnd.get()))
+
+    pub fn id(&self) -> RootWindowId {
+        RootWindowId(WindowId(**self))
     }
 
     pub fn set_icon(&self, icon: Icon) -> Result<(), RootOsError> {
@@ -104,7 +107,49 @@ impl Deref for Tray {
     }
 }
 
-pub fn init_window<T: 'static>(parent_hwnd: Option<HWND>) -> Result<Tray, RootOsError> {
+pub struct InitData<'a, T: 'static> {
+    pub event_loop: &'a EventLoopWindowTarget<T>,
+    // outputs
+    pub window: Option<HWND>,
+}
+
+impl<'a, T: 'static> InitData<'a, T> {
+    unsafe fn on_nccreate(&mut self, window: HWND) -> Option<isize> {
+        let runner = self.event_loop.runner_shared.clone();
+
+        let result = runner.catch_unwind(|| {
+            let window_data = WindowData {
+                event_loop_runner: self.event_loop.runner_shared.clone(),
+                userdata_removed: Cell::new(false),
+                recurse_depth: Cell::new(0),
+            };
+            window_data
+        });
+        result.map(|userdata| {
+            self.window = Some(window);
+            let userdata = Box::into_raw(Box::new(userdata));
+            userdata as _
+        })
+    }
+}
+
+pub(crate) struct WindowData<T: 'static> {
+    pub event_loop_runner: EventLoopRunnerShared<T>,
+    pub userdata_removed: Cell<bool>,
+    pub recurse_depth: Cell<u32>,
+}
+impl<T> WindowData<T> {
+    fn send_event(&self, event: Event<T>) {
+        self.event_loop_runner.send_event(event);
+    }
+}
+
+
+pub fn init_window<T: 'static>(
+    parent_window: Option<RawWindowHandle>,
+    tooltip: Option<String>,
+    event_loop: &EventLoopWindowTarget<T>,
+) -> Result<Tray, RootOsError> {
     let hmodule = unsafe { GetModuleHandleW(std::ptr::null()) };
     if hmodule == 0 {
         return Err(os_error!(std::io::Error::last_os_error()));
@@ -112,19 +157,42 @@ pub fn init_window<T: 'static>(parent_hwnd: Option<HWND>) -> Result<Tray, RootOs
 
     let class_name = util::encode_wide("my_window");
 
-    let mut wnd = unsafe { std::mem::zeroed::<WNDCLASSW>() };
-    wnd.lpfnWndProc = Some(window_proc);
-    // wnd.lpfnWndProc = Some(super::event_loop::public_window_callback::<T>);
-    wnd.lpszClassName = class_name.as_ptr();
+    let wnd = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(window_proc::<T>),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: util::get_instance_handle(),
+        hIcon: 0,
+        hCursor: 0, // must be null in order for cursor state to work properly
+        hbrBackground: 0,
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: class_name.as_ptr(),
+        hIconSm: 0,
+    };
 
-    unsafe { RegisterClassW(&wnd) };
-    println!("print");
+    unsafe { RegisterClassExW(&wnd) };
+
+    let parent_hwnd = match parent_window {
+        Some(RawWindowHandle::Win32(handle)) => Some(handle.hwnd.get()),
+        Some(_) => unreachable!("Invalid raw window handle {parent_window:?} on Windows"),
+        _ => None,
+    };
+
+    let mut initdata = InitData {
+        event_loop,
+        window: None,
+    };
+
+    println!("hwnd: {:?}", initdata.window);
+
 
     let hwnd = unsafe {
         CreateWindowExW(
             0,
             class_name.as_ptr(),
-            util::encode_wide("rust_systray_window").as_ptr(),
+            util::encode_wide(tooltip.unwrap_or("rust_systray_window".to_string())).as_ptr(),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             0,
@@ -132,13 +200,23 @@ pub fn init_window<T: 'static>(parent_hwnd: Option<HWND>) -> Result<Tray, RootOs
             0,
             parent_hwnd.unwrap_or(0) as HWND,
             0,
-            0,
-            std::ptr::null(),
+            util::get_instance_handle(),
+            &mut initdata as *mut _ as *mut _,
         )
     };
+
+    // If the window creation in `InitData` panicked, then should resume panicking here
+    if let Err(panic_error) = event_loop.runner_shared.take_panic_error() {
+        std::panic::resume_unwind(panic_error)
+    }
+
     if hwnd == 0 {
         return Err(os_error!(std::io::Error::last_os_error()));
     }
+
+    // If the handle is non-null, then window creation must have succeeded, which means
+    // that we *must* have populated the `InitData.window` field.
+    // let win = initdata.window.unwrap();
 
     let icon: HICON = unsafe {
         let mut handle = LoadIconW(
@@ -182,139 +260,151 @@ pub fn init_window<T: 'static>(parent_hwnd: Option<HWND>) -> Result<Tray, RootOs
     Ok(Tray(hwnd))
 }
 
-#[derive(Debug)]
-pub enum Click {
-    Single(crate::event::MouseButton),
-    Double(crate::event::MouseButton),
-}
-
-#[derive(Debug)]
-pub struct TrayEvent {
-    mouse: Click,
-    position: (i32, i32),
-}
-
-pub(crate) extern "system" fn window_proc(
-    h_wnd: HWND,
+pub(crate) extern "system" fn window_proc<T: 'static>(
+    window: HWND,
     msg: u32,
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    static mut U_TASKBAR_RESTART: u32 = 0;
+    let userdata = unsafe { super::get_window_long(window, GWL_USERDATA) };
 
-    if msg == WM_MENUCOMMAND {
-        // WININFO_STASH.with(|stash| {
-        //     let stash = stash.borrow();
-        //     let stash = stash.as_ref();
-        //     if let Some(stash) = stash {
-        //         let menu_id = GetMenuItemID(stash.info.hmenu, w_param as i32) as i32;
-        //         if menu_id != -1 {
-        //             stash.tx.send(WindowsTrayEvent(menu_id as u32)).ok();
-        //         }
-        //     }
-        // });
+    let userdata_ptr = match (userdata, msg) {
+        (0, WM_NCCREATE) => {
+            let createstruct = unsafe { &mut *(l_param as *mut CREATESTRUCTW) };
+            let initdata = unsafe { &mut *(createstruct.lpCreateParams as *mut InitData<'_, T>) };
+
+            let result = match unsafe { initdata.on_nccreate(window) } {
+                Some(userdata) => unsafe {
+                    super::set_window_long(window, GWL_USERDATA, userdata as _);
+                    DefWindowProcW(window, msg, w_param, l_param)
+                },
+                None => -1, // failed to create the window
+            };
+            return result;
+        }
+        // Getting here should quite frankly be impossible,
+        // but we'll make window creation fail here just in case.
+        (0, WM_CREATE) => return -1,
+        (_, WM_CREATE) => unsafe {
+            let createstruct = &mut *(l_param as *mut CREATESTRUCTW);
+            let initdata = createstruct.lpCreateParams;
+            let initdata = &mut *(initdata as *mut InitData<'_, T>);
+
+            return DefWindowProcW(window, msg, w_param, l_param);
+        },
+        (0, _) => return unsafe { DefWindowProcW(window, msg, w_param, l_param) },
+        _ => userdata as *mut WindowData<T>,
+    };
+
+    let (result, userdata_removed, recurse_depth) = {
+        let userdata = unsafe { &*(userdata_ptr) };
+
+        userdata.recurse_depth.set(userdata.recurse_depth.get() + 1);
+
+        let result =
+            unsafe { public_window_callback_inner(window, msg, w_param, l_param, userdata) };
+
+        let userdata_removed = userdata.userdata_removed.get();
+        let recurse_depth = userdata.recurse_depth.get() - 1;
+        userdata.recurse_depth.set(recurse_depth);
+
+        (result, userdata_removed, recurse_depth)
+    };
+
+    if userdata_removed && recurse_depth == 0 {
+        drop(unsafe { Box::from_raw(userdata_ptr) });
     }
 
-    // if msg == WM_USER + 1 && l_param as u32 != WM_MOUSEMOVE {
-    //     println!("l_param: {}", l_param);
-    //     println!("w_param: {}", w_param);
-    // }
+    result
+}
 
+unsafe fn public_window_callback_inner<T: 'static>(
+    window: HWND,
+    msg: u32,
+    w_param: WPARAM,
+    l_param: LPARAM,
+    userdata: &WindowData<T>,
+) -> LRESULT {
+    let mut result = ProcResult::DefWindowProc(w_param);
+
+    if msg == WM_USER + 1
+        && (l_param as u32 == WM_LBUTTONUP
+            || l_param as u32 == WM_RBUTTONUP
+            || l_param as u32 == WM_MBUTTONUP
+            || l_param as u32 == WM_XBUTTONUP
+            || l_param as u32 == WM_LBUTTONDOWN
+            || l_param as u32 == WM_RBUTTONDOWN
+            || l_param as u32 == WM_MBUTTONDOWN
+            || l_param as u32 == WM_XBUTTONDOWN)
     {
-        let l_param = l_param as u32;
-
-        if msg == WM_USER + 1
-            && (l_param == WM_LBUTTONUP
-                || l_param == WM_LBUTTONDBLCLK
-                || l_param == WM_RBUTTONUP
-                || l_param == WM_RBUTTONDBLCLK
-                || l_param == WM_MBUTTONUP
-                || l_param == WM_MBUTTONDBLCLK
-                || l_param == WM_XBUTTONUP
-                || l_param == WM_XBUTTONDBLCLK)
-        {
-            let mut point = POINT { x: 0, y: 0 };
-            if unsafe { GetCursorPos(&mut point) } == 0 {
-                return 1;
-            }
-
-            let click = match l_param as u32 {
-                WM_LBUTTONUP => Click::Single(crate::event::MouseButton::Left),
-                WM_RBUTTONUP => Click::Single(crate::event::MouseButton::Right),
-                WM_MBUTTONUP => Click::Single(crate::event::MouseButton::Middle),
-                WM_XBUTTONUP => Click::Single(crate::event::MouseButton::Forward),
-                WM_LBUTTONDBLCLK => Click::Double(crate::event::MouseButton::Left),
-                WM_RBUTTONDBLCLK => Click::Double(crate::event::MouseButton::Right),
-                WM_MBUTTONDBLCLK => Click::Double(crate::event::MouseButton::Middle),
-                WM_XBUTTONDBLCLK => Click::Double(crate::event::MouseButton::Forward),
-                _ => panic!("shouldnt be anything other than left or right click"),
-            };
-
-            let event = TrayEvent {
-                mouse: click,
-                position: (point.x, point.y),
-            };
-
-            println!("{:?}", event);
-
-            unsafe { SetForegroundWindow(h_wnd) };
-
-            // WININFO_STASH.with(|stash| {
-            //     let stash = stash.borrow();
-            //     let stash = stash.as_ref();
-            //     if let Some(stash) = stash {
-            //         TrackPopupMenu(
-            //             stash.info.hmenu,
-            //             TPM_LEFTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-            //             point.x,
-            //             point.y,
-            //             0,
-            //             h_wnd,
-            //             ptr::null(),
-            //         );
-            //     }
-            // });
-        }
-    }
-
-    if msg == WM_CREATE {
-        unsafe {
-            U_TASKBAR_RESTART = RegisterWindowMessageW(util::encode_wide("TaskbarCreated").as_ptr())
+        let (button, state) = match l_param as u32 {
+            x if x == WM_LBUTTONUP => (
+                crate::event::MouseButton::Left,
+                crate::event::ElementState::Released,
+            ),
+            x if x == WM_RBUTTONUP => (
+                crate::event::MouseButton::Right,
+                crate::event::ElementState::Released,
+            ),
+            x if x == WM_MBUTTONUP => (
+                crate::event::MouseButton::Middle,
+                crate::event::ElementState::Released,
+            ),
+            x if x == WM_XBUTTONUP => (
+                crate::event::MouseButton::Other(0),
+                crate::event::ElementState::Released,
+            ),
+            x if x == WM_LBUTTONDOWN => (
+                crate::event::MouseButton::Left,
+                crate::event::ElementState::Pressed,
+            ),
+            x if x == WM_RBUTTONDOWN => (
+                crate::event::MouseButton::Right,
+                crate::event::ElementState::Pressed,
+            ),
+            x if x == WM_MBUTTONDOWN => (
+                crate::event::MouseButton::Middle,
+                crate::event::ElementState::Pressed,
+            ),
+            x if x == WM_XBUTTONDOWN => (
+                crate::event::MouseButton::Other(0),
+                crate::event::ElementState::Pressed,
+            ),
+            _ => unreachable!("Invalid mouse button event"),
         };
+
+        use crate::event::WindowEvent::{CursorMoved, MouseInput};
+        let x = super::get_x_lparam(l_param as u32) as i32;
+        let y = super::get_y_lparam(l_param as u32) as i32;
+        let position = PhysicalPosition::new(x as f64, y as f64);
+        println!("sending mouse move event5");
+
+        userdata
+            .send_event(Event::WindowEvent {
+                window_id: RootWindowId(WindowId(window)),
+                event: CursorMoved {
+                    device_id: DEVICE_ID,
+                    position,
+                },
+            });
+
+        userdata
+            .send_event(Event::WindowEvent {
+                window_id: RootWindowId(WindowId(window)),
+                event: MouseInput {
+                    device_id: DEVICE_ID,
+                    state,
+                    button,
+                },
+            });
+
+        result = ProcResult::Value(0);
     }
 
-    // If windows explorer restarts and we need to recreate the tray icon
-    if msg == unsafe { U_TASKBAR_RESTART } {
-        let icon: HICON = unsafe {
-            let mut handle = LoadIconW(
-                GetModuleHandleW(std::ptr::null()),
-                util::encode_wide("tray-default").as_ptr(),
-            );
-            if handle == 0 {
-                handle = LoadIconW(0, IDI_APPLICATION);
-            }
-            if handle == 0 {
-                println!("Error setting icon from resource");
-                PostQuitMessage(0);
-            }
-            handle as HICON
-        };
-        let mut nid = unsafe { std::mem::zeroed::<NOTIFYICONDATAW>() };
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = h_wnd;
-        nid.uID = 1;
-        nid.uFlags = NIF_MESSAGE | NIF_ICON;
-        nid.hIcon = icon;
-        nid.uCallbackMessage = WM_USER + 1;
-        if unsafe { Shell_NotifyIconW(NIM_ADD, &nid) } == 0 {
-            println!("Error adding menu icon");
-            unsafe { PostQuitMessage(0) };
-        }
+    match result {
+        ProcResult::DefWindowProc(wparam) => unsafe {
+            DefWindowProcW(window, msg, wparam, l_param)
+        },
+        ProcResult::Value(val) => val,
     }
-
-    if msg == WM_DESTROY {
-        unsafe { PostQuitMessage(0) };
-    }
-
-    unsafe { DefWindowProcW(h_wnd, msg, w_param, l_param) }
 }

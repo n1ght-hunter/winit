@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-mod runner;
+pub(super) mod runner;
 
 use std::{
     cell::Cell,
@@ -957,7 +957,6 @@ pub(super) unsafe extern "system" fn public_window_callback<T: 'static>(
                 },
                 None => -1, // failed to create the window
             };
-
             return result;
         }
         // Getting here should quite frankly be impossible,
