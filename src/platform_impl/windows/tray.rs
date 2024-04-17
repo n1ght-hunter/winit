@@ -9,7 +9,15 @@ use windows_sys::Win32::{
             Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_MODIFY, NOTIFYICONDATAW,
         },
         WindowsAndMessaging::{
-            CreatePopupMenu, CreateWindowExW, DefWindowProcW, GetCursorPos, LoadIconW, PostQuitMessage, RegisterClassExW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetMenuInfo, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_USERDATA, HICON, IDI_APPLICATION, MENUINFO, MIM_APPLYTOSUBMENUS, MIM_STYLE, MNS_NOTIFYBYPOS, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MENUCOMMAND, WM_MOUSEMOVE, WM_NCCREATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WNDCLASSW, WS_OVERLAPPEDWINDOW
+            CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos,
+            LoadIconW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterClassW,
+            RegisterWindowMessageW, SetForegroundWindow, SetMenuInfo, CREATESTRUCTW, CS_HREDRAW,
+            CS_VREDRAW, CW_USEDEFAULT, GWL_USERDATA, HICON, IDI_APPLICATION, MENUINFO,
+            MIM_APPLYTOSUBMENUS, MIM_STYLE, MNS_NOTIFYBYPOS, WM_CREATE, WM_DESTROY,
+            WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
+            WM_MBUTTONUP, WM_MENUCOMMAND, WM_MOUSEMOVE, WM_NCCREATE, WM_RBUTTONDBLCLK,
+            WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP,
+            WNDCLASSEXW, WNDCLASSW, WS_OVERLAPPEDWINDOW,
         },
     },
 };
@@ -23,7 +31,10 @@ use crate::{
     window::{Icon, WindowId as RootWindowId},
 };
 
-use super::{event_loop::runner::EventLoopRunnerShared, util, EventLoopWindowTarget};
+use super::{
+    event_loop::{runner::EventLoopRunnerShared, DESTROY_MSG_ID},
+    util, EventLoopWindowTarget,
+};
 
 #[derive(Clone)]
 pub struct Tray(HWND);
@@ -99,6 +110,16 @@ impl Tray {
 unsafe impl Send for Tray {}
 unsafe impl Sync for Tray {}
 
+impl Drop for Tray {
+    fn drop(&mut self) {
+        unsafe {
+            // The window must be destroyed from the same thread that created it, so we send a
+            // custom message to be handled by our callback to do the actual work.
+            PostMessageW(self.0, DESTROY_MSG_ID.get(), 0, 0);
+        }
+    }
+}
+
 impl Deref for Tray {
     type Target = HWND;
 
@@ -144,7 +165,6 @@ impl<T> WindowData<T> {
     }
 }
 
-
 pub fn init_window<T: 'static>(
     parent_window: Option<RawWindowHandle>,
     tooltip: Option<String>,
@@ -186,7 +206,6 @@ pub fn init_window<T: 'static>(
     };
 
     println!("hwnd: {:?}", initdata.window);
-
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -327,60 +346,60 @@ unsafe fn public_window_callback_inner<T: 'static>(
 ) -> LRESULT {
     let mut result = ProcResult::DefWindowProc(w_param);
 
-    if msg == WM_USER + 1
-        && (l_param as u32 == WM_LBUTTONUP
+    match msg {
+        1025 if (l_param as u32 == WM_LBUTTONUP
             || l_param as u32 == WM_RBUTTONUP
             || l_param as u32 == WM_MBUTTONUP
             || l_param as u32 == WM_XBUTTONUP
             || l_param as u32 == WM_LBUTTONDOWN
             || l_param as u32 == WM_RBUTTONDOWN
             || l_param as u32 == WM_MBUTTONDOWN
-            || l_param as u32 == WM_XBUTTONDOWN)
-    {
-        let (button, state) = match l_param as u32 {
-            x if x == WM_LBUTTONUP => (
-                crate::event::MouseButton::Left,
-                crate::event::ElementState::Released,
-            ),
-            x if x == WM_RBUTTONUP => (
-                crate::event::MouseButton::Right,
-                crate::event::ElementState::Released,
-            ),
-            x if x == WM_MBUTTONUP => (
-                crate::event::MouseButton::Middle,
-                crate::event::ElementState::Released,
-            ),
-            x if x == WM_XBUTTONUP => (
-                crate::event::MouseButton::Other(0),
-                crate::event::ElementState::Released,
-            ),
-            x if x == WM_LBUTTONDOWN => (
-                crate::event::MouseButton::Left,
-                crate::event::ElementState::Pressed,
-            ),
-            x if x == WM_RBUTTONDOWN => (
-                crate::event::MouseButton::Right,
-                crate::event::ElementState::Pressed,
-            ),
-            x if x == WM_MBUTTONDOWN => (
-                crate::event::MouseButton::Middle,
-                crate::event::ElementState::Pressed,
-            ),
-            x if x == WM_XBUTTONDOWN => (
-                crate::event::MouseButton::Other(0),
-                crate::event::ElementState::Pressed,
-            ),
-            _ => unreachable!("Invalid mouse button event"),
-        };
+            || l_param as u32 == WM_XBUTTONDOWN) =>
+        {
+            let (button, state) = match l_param as u32 {
+                x if x == WM_LBUTTONUP => (
+                    crate::event::MouseButton::Left,
+                    crate::event::ElementState::Released,
+                ),
+                x if x == WM_RBUTTONUP => (
+                    crate::event::MouseButton::Right,
+                    crate::event::ElementState::Released,
+                ),
+                x if x == WM_MBUTTONUP => (
+                    crate::event::MouseButton::Middle,
+                    crate::event::ElementState::Released,
+                ),
+                x if x == WM_XBUTTONUP => (
+                    crate::event::MouseButton::Other(0),
+                    crate::event::ElementState::Released,
+                ),
+                x if x == WM_LBUTTONDOWN => (
+                    crate::event::MouseButton::Left,
+                    crate::event::ElementState::Pressed,
+                ),
+                x if x == WM_RBUTTONDOWN => (
+                    crate::event::MouseButton::Right,
+                    crate::event::ElementState::Pressed,
+                ),
+                x if x == WM_MBUTTONDOWN => (
+                    crate::event::MouseButton::Middle,
+                    crate::event::ElementState::Pressed,
+                ),
+                x if x == WM_XBUTTONDOWN => (
+                    crate::event::MouseButton::Other(0),
+                    crate::event::ElementState::Pressed,
+                ),
+                _ => unreachable!("Invalid mouse button event"),
+            };
 
-        use crate::event::WindowEvent::{CursorMoved, MouseInput};
-        let x = super::get_x_lparam(l_param as u32) as i32;
-        let y = super::get_y_lparam(l_param as u32) as i32;
-        let position = PhysicalPosition::new(x as f64, y as f64);
-        println!("sending mouse move event5");
+            use crate::event::WindowEvent::{CursorMoved, MouseInput};
+            let mut point = POINT { x: 0, y: 0 };
+            if unsafe { GetCursorPos(&mut point) } == 0 {
+                return 1;
+            }
+            let position = PhysicalPosition::new(point.x as f64, point.y as f64);
 
-        userdata
-            .send_event(Event::WindowEvent {
+            userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: CursorMoved {
                     device_id: DEVICE_ID,
@@ -388,8 +407,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 },
             });
 
-        userdata
-            .send_event(Event::WindowEvent {
+            userdata.send_event(Event::WindowEvent {
                 window_id: RootWindowId(WindowId(window)),
                 event: MouseInput {
                     device_id: DEVICE_ID,
@@ -398,8 +416,18 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 },
             });
 
-        result = ProcResult::Value(0);
-    }
+            result = ProcResult::Value(0);
+        }
+
+        _ => {
+            if msg == DESTROY_MSG_ID.get() {
+                unsafe { DestroyWindow(window) };
+                result = ProcResult::Value(0);
+            } else {
+                result = ProcResult::DefWindowProc(w_param);
+            }
+        }
+    };
 
     match result {
         ProcResult::DefWindowProc(wparam) => unsafe {
