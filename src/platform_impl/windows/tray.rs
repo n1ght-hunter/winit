@@ -205,8 +205,6 @@ pub fn init_window<T: 'static>(
         window: None,
     };
 
-    println!("hwnd: {:?}", initdata.window);
-
     let hwnd = unsafe {
         CreateWindowExW(
             0,
